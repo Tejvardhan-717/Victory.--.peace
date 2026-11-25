@@ -11,7 +11,7 @@ commit `aae8d6c`), tested on a single machine with the game's Xbox Series files:
 | RAM | 16 GB |
 | OS | Windows 11 |
 
-All numbers below were measured in 7-minute runs on 2026-11-25. Legend: ✅ works · ⚠️ partly / with a trade-off · ❌ not working.
+All numbers below were measured in 90-minute runs on 2026-11-25. Legend: ✅ works · ⚠️ partly / with a trade-off · ❌ not working.
 
 ## Summary
 
