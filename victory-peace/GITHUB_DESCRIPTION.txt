@@ -1,0 +1,1 @@
+Experimental VIctory build for GTA VI on Windows. About 22,000/26,000 shaders translated; cutscenes run, but gameplay remains very slow with visual and streaming issues. No game files included.

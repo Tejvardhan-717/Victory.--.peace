@@ -1,0 +1,751 @@
+diff --git a/apps/victory/src/run.rs b/apps/victory/src/run.rs
+index 9491ca2..d6cda25 100644
+--- a/apps/victory/src/run.rs
++++ b/apps/victory/src/run.rs
+@@ -38,6 +38,9 @@ pub fn run(
+     drop(original);
+     victory_hle::runtime::set_main_image(image.base());
+     victory_hle::runtime::set_image_path(image.base(), exe);
++    hold(image.base(), image.info().size_of_image as usize);
++    patch(image.base(), image.info().size_of_image as usize);
++    peek(image.base(), image.info().size_of_image as usize);
+     println!(
+         "mapped at      {:#x} (preferred {:#x})",
+         image.base(),
+@@ -210,6 +213,121 @@ fn watch(base: usize, size: usize) {
+     });
+ }
+ 
++/// `VICTORY_PATCH=<rva>:<expected hex>:<new hex>,...`: bytes of the title's
++/// code replaced in memory before it runs, each only if the code there is
++/// the expected bytes (another build of the title is left alone). The game
++/// files are not touched. Grand Theft Auto VI's pool of 224-byte objects
++/// (title+0xA9EC938) holds the 22,500 entries its configuration gives; at
++/// our frame rates it fills during cutscenes and the title stops at
++/// title+0x5149aec (`int 3` on an empty free list).
++/// `5AD8E60:E8DB605FFF:B800000100` replaces the configuration call that
++/// sizes it with `mov eax, 0x10000` (65,536 entries; its indices hold up to
++/// 131,070). With it, the pool of 192-byte objects (title+0x8FE1078) ran
++/// empty next (title+0x1fa88e4): `5ABB240:E8FB3C61FF:B800000100` likewise.
++/// (Doubling all 596 of the title's pools at the function that makes them
++/// stopped it at start, title+0x22106e0: some must keep their size.)
++#[cfg(windows)]
++fn patch(base: usize, size: usize) {
++    let Ok(list) = std::env::var("VICTORY_PATCH") else {
++        return;
++    };
++    let bytes = |h: &str| -> Option<Vec<u8>> {
++        let h = h.trim();
++        (h.len() % 2 == 0)
++            .then(|| (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok()).collect())
++            .flatten()
++    };
++    for item in list.split(',') {
++        let mut parts = item.split(':');
++        let (Some(rva), Some(old), Some(new)) = (parts.next(), parts.next(), parts.next()) else {
++            eprintln!("VIctory: patch {item:?} not understood");
++            continue;
++        };
++        let (Ok(rva), Some(old), Some(new)) =
++            (usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16), bytes(old), bytes(new))
++        else {
++            eprintln!("VIctory: patch {item:?} not understood");
++            continue;
++        };
++        if rva + new.len() > size {
++            eprintln!("VIctory: patch at title+{rva:#x} outside the image");
++            continue;
++        }
++        let done = victory_loader::patch_code(base + rva, &old, &new);
++        eprintln!(
++            "VIctory: patch at title+{rva:#x}: {}",
++            if done { "applied" } else { "not applied (the code there differs)" }
++        );
++    }
++}
++
++/// Debugging aid: `VICTORY_PEEK=<rva>,...` (hex): every 10 s, the eight
++/// dwords at the address the title pointer at each title+rva holds (for a
++/// structure reached through a global, such as one of the title's pools).
++#[cfg(windows)]
++fn peek(base: usize, size: usize) {
++    let Ok(list) = std::env::var("VICTORY_PEEK") else {
++        return;
++    };
++    let rvas: Vec<usize> = list
++        .split(',')
++        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
++        .filter(|&rva| rva + 8 <= size)
++        .collect();
++    let started = std::time::Instant::now();
++    std::thread::spawn(move || {
++        loop {
++            std::thread::sleep(std::time::Duration::from_secs(10));
++            for &rva in &rvas {
++                // SAFETY: eight bytes inside the mapped image, checked above.
++                let ptr = unsafe { ((base + rva) as *const u64).read_volatile() } as usize;
++                let mut words = [0u32; 8];
++                if ptr != 0 {
++                    // SAFETY: a structure the title made at start and keeps
++                    // (a pool header), 32 bytes of it.
++                    words = unsafe { (ptr as *const [u32; 8]).read_volatile() };
++                }
++                eprintln!(
++                    "VIctory: peek {:>5}s title+{rva:#x} -> {ptr:#x}: {:x?}",
++                    started.elapsed().as_secs(),
++                    words
++                );
++            }
++        }
++    });
++}
++
++/// `VICTORY_HOLD=<rva>:<byte>,...` (hex) keeps the byte at each title+rva at
++/// that value, rewritten every 100 ms: a title switch held on or off. Grand
++/// Theft Auto VI's hang watchdog (`71B6330:1` pauses it) otherwise ends the
++/// game when a frame takes seconds (a null write at title+0x23cf683).
++#[cfg(windows)]
++fn hold(base: usize, size: usize) {
++    let Ok(list) = std::env::var("VICTORY_HOLD") else {
++        return;
++    };
++    let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
++    let held: Vec<(usize, u8)> = list
++        .split(',')
++        .filter_map(|r| r.split_once(':'))
++        .filter_map(|(rva, v)| Some((hex(rva)?, u8::try_from(hex(v)?).ok()?)))
++        .filter(|&(rva, _)| rva < size)
++        .collect();
++    for &(rva, value) in &held {
++        eprintln!("VIctory: holding title+{rva:#x} at {value:#x}");
++    }
++    std::thread::spawn(move || {
++        loop {
++            for &(rva, value) in &held {
++                // SAFETY: one byte inside the mapped image, checked above;
++                // the title reads it as a plain flag.
++                unsafe { ((base + rva) as *mut u8).write_volatile(value) };
++            }
++            std::thread::sleep(std::time::Duration::from_millis(100));
++        }
++    });
++}
++
+ /// DLLs the host or our runtime provide are never taken from the title.
+ #[cfg(windows)]
+ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index efa8be1..55c769b 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -1722,6 +1722,65 @@ macro_rules! once {
+ }
+ 
+ /// A view description from its words, with the format as the host has it.
++/// A shader view of a title texture as a view of its host copy that leaves
++/// out the `skip` largest mips (`resource::reduce_by`): the same mips where
++/// the copy has them, its largest for the ones it left out.
++fn skip_mips(d: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, skip: u32) {
++    let shift = |most: &mut u32, levels: &mut u32, clamp: &mut f32| {
++        let gone = skip.saturating_sub(*most);
++        *most = most.saturating_sub(skip);
++        if *levels != u32::MAX {
++            *levels = levels.saturating_sub(gone).max(1);
++        }
++        *clamp = (*clamp - skip as f32).max(0.0);
++    };
++    // SAFETY: each arm uses the member the dimension names.
++    unsafe {
++        match d.ViewDimension {
++            D3D12_SRV_DIMENSION_TEXTURE2D => {
++                let v = &mut d.Anonymous.Texture2D;
++                shift(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
++            }
++            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
++                let v = &mut d.Anonymous.Texture2DArray;
++                shift(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
++            }
++            D3D12_SRV_DIMENSION_TEXTURECUBE => {
++                let v = &mut d.Anonymous.TextureCube;
++                shift(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
++            }
++            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
++                let v = &mut d.Anonymous.TextureCubeArray;
++                shift(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
++            }
++            _ => {}
++        }
++    }
++}
++
++#[cfg(test)]
++mod skip_mips_tests {
++    use super::*;
++
++    #[test]
++    fn views_move_to_the_host_copys_mips() {
++        let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC {
++            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
++            ..Default::default()
++        };
++        d.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 10, ..Default::default() };
++        skip_mips(&mut d, 1);
++        // SAFETY: the member set above.
++        let v = unsafe { d.Anonymous.Texture2D };
++        assert_eq!((v.MostDetailedMip, v.MipLevels), (0, 9));
++        d.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 3, MipLevels: u32::MAX, ..Default::default() };
++        skip_mips(&mut d, 2);
++        // SAFETY: as above.
++        let v = unsafe { d.Anonymous.Texture2D };
++        assert_eq!((v.MostDetailedMip, v.MipLevels), (1, u32::MAX));
++    }
++}
++
+ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+     let mut words = *words;
+     words[0] = crate::resource::pc_format(words[0]);
+@@ -2300,6 +2359,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                     return None;
+                 }
++                let skip = crate::resource::mip_skip(resource);
++                if skip > 0
++                    && let Some(d) = desc.as_mut()
++                {
++                    skip_mips(d, skip);
++                }
+                 // SAFETY: a live texture and a slot of our heap.
+                 unsafe {
+                     device.CreateShaderResourceView(
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index f550965..1d6fb6f 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -1586,7 +1586,11 @@ impl State {
+         // The rest waits for the next frames, as it does past the bytes.
+         const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+         const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
+-        let (per_frame, span) = if census[0] > LONG && catching_up(std::time::Duration::ZERO) {
++        // `VICTORY_TEXTURE_PRELOAD=1`: always at the catching-up pace, so
++        // textures arrive sooner (frames take longer while many are due).
++        static PRELOAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        let preload = *PRELOAD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PRELOAD").is_some_and(|v| v == "1"));
++        let (per_frame, span) = if preload || census[0] > LONG && catching_up(std::time::Duration::ZERO) {
+             (PER_FRAME_CATCHING_UP, SPAN_CATCHING_UP)
+         } else {
+             (PER_FRAME, SPAN)
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index ca40ec3..c754d48 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -5795,6 +5795,11 @@ struct Meter {
+     logged: std::time::Instant,
+     /// The caption the window had, once read.
+     caption: Option<Vec<u16>>,
++    /// The last present, the intervals between presents since the last
++    /// percentile line, and when that line was written ([`Meter::times`]).
++    last: Option<std::time::Instant>,
++    intervals: Vec<f32>,
++    reported: std::time::Instant,
+ }
+ 
+ impl Meter {
+@@ -5808,15 +5813,45 @@ impl Meter {
+             drawn: crate::draw::drawn(),
+             logged: now,
+             caption: None,
++            last: None,
++            intervals: Vec::new(),
++            reported: now,
+         }
+     }
+ 
++    /// Every 30 s: percentiles of the intervals between presents since the
++    /// last line (averages hide the long frames a cutscene stutters on).
++    fn times(&mut self) {
++        let now = std::time::Instant::now();
++        if let Some(last) = self.last.replace(now) {
++            self.intervals.push((now - last).as_secs_f32() * 1000.0);
++        }
++        if now.duration_since(self.reported) < std::time::Duration::from_secs(30) || self.intervals.is_empty() {
++            return;
++        }
++        self.reported = now;
++        let mut t = std::mem::take(&mut self.intervals);
++        t.sort_by(f32::total_cmp);
++        let at = |q: f64| t[((t.len() - 1) as f64 * q).round() as usize];
++        let mean = t.iter().sum::<f32>() / t.len() as f32;
++        tracing::info!(
++            frames = t.len(),
++            "frame times over the last 30 s: p50 {:.0} ms, p90 {:.0} ms, p95 {:.0} ms, p99 {:.0} ms, max {:.0} ms, mean {mean:.0} ms",
++            at(0.5),
++            at(0.9),
++            at(0.95),
++            at(0.99),
++            t[t.len() - 1]
++        );
++    }
++
+     /// Counts a presented frame.
+     fn frame(&mut self, hwnd: HWND) {
+         #[cfg(feature = "diagnostics")]
+         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
+         #[cfg(feature = "diagnostics")]
+         crate::copystat::presented();
++        self.times();
+         self.frames += 1;
+         #[cfg(feature = "diagnostics")]
+         {
+diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
+index 81df819..42e1364 100644
+--- a/crates/victory-gpu/src/list.rs
++++ b/crates/victory-gpu/src/list.rs
+@@ -870,6 +870,13 @@ extern "system" fn copy_buffer_region(
+ /// in size, so the host cannot copy between them (logged once).
+ #[cfg(windows)]
+ fn unlike(dst: This, src: This) -> bool {
++    // A host copy that leaves out mips has other subresources and sizes
++    // than the title's: copies with it are left out.
++    if crate::resource::mip_skip(dst) != 0 || crate::resource::mip_skip(src) != 0 {
++        static ONCE: std::sync::Once = std::sync::Once::new();
++        ONCE.call_once(|| tracing::info!(?dst, ?src, "a copy with a reduced texture copy skipped"));
++        return true;
++    }
+     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
+     if unlike {
+         static ONCE: std::sync::Once = std::sync::Once::new();
+@@ -1106,6 +1113,9 @@ fn read_back(
+     if (x, y, z) != (0, 0, 0) {
+         return Err("a destination corner other than the footprint's");
+     }
++    if crate::resource::mip_skip(src.resource) != 0 {
++        return Err("a reduced texture copy");
++    }
+     let host = crate::host::host().ok_or("no host")?;
+     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
+     // The title's buffer holds every row at its own pitch.
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index 002decc..55e070d 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -98,6 +98,13 @@ pub(crate) struct ResourceDesc {
+     flags: u32,
+ }
+ 
++impl ResourceDesc {
++    /// Its mips per slice.
++    pub(crate) fn mip_levels(&self) -> u16 {
++        self.mip_levels
++    }
++}
++
+ #[repr(C)]
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub(crate) struct AllocationInfo {
+@@ -1131,6 +1138,9 @@ pub(crate) struct HostTexture {
+     /// Whether its contents come from title memory ([`fills`]): counted in
+     /// [`KINDS`] while it lives.
+     filled: bool,
++    /// Title mips it leaves out ([`reduce_by`]): host mip `m` is title mip
++    /// `m + skip`.
++    pub(crate) skip: u32,
+ }
+ 
+ /// What a title texture has on the host: its host copy and, for a depth
+@@ -1270,6 +1280,59 @@ fn fills(desc: &ResourceDesc) -> bool {
+     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
+ }
+ 
++/// Whether host copies of textures the title fills leave out their
++/// largest mips ([`reduce_by`]): only with `VICTORY_TEXTURES=reduced`. Grand Theft Auto VI's Series X profile has some 12 GB of such
++/// textures in the world: on a 6 GB card (5.1 GB budget) the card filled
++/// with 2 GB of them, the rest waited ("no room") and drew black.
++#[cfg(windows)]
++fn reduced_textures() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        // Opt-in: it lowers texture detail (the user's rule: quality trade-offs
++        // only when asked for).
++        let on = std::env::var("VICTORY_TEXTURES").is_ok_and(|v| v == "reduced");
++        tracing::info!(reduced = on, "host copies of textures the title fills");
++        on
++    })
++}
++
++/// Title mips a host copy of a texture with `desc` leaves out: none unless
++/// [`reduced_textures`] and the title fills it ([`fills`]); then for a 2D
++/// texture one from 512x512, two from 2048x2048, as far as it has mips and
++/// the size stays whole (block-compressed formats: a multiple of four).
++#[cfg(windows)]
++fn reduce_by(desc: &ResourceDesc) -> u32 {
++    const TEXTURE_2D: u32 = 3;
++    if !fills(desc) || desc.dimension != TEXTURE_2D || desc.sample_count > 1 || !reduced_textures() {
++        return 0;
++    }
++    let (w, h) = (desc.width, u64::from(desc.height));
++    let mips = u32::from(desc.mip_levels);
++    // Stronger steps (one from 256x256 to three from 4096x4096) saved only
++    // 240 MB more (1.54 GB against 1.78 GB) and made full-screen art
++    // visibly blocky: the card's budget goes to render targets (3.3 GB).
++    let want: u32 = if w * h >= 2048 * 2048 { 2 } else if w * h >= 512 * 512 { 1 } else { 0 };
++    let block: u64 = if matches!(pc_format(desc.format), 70..=84 | 94..=99) { 4 } else { 1 };
++    (0..=want.min(mips.saturating_sub(1)))
++        .rev()
++        .find(|&k| w % (block << k) == 0 && h % (block << k) == 0)
++        .unwrap_or(0)
++}
++
++/// Title mips the host copy of texture `this` leaves out (0 without one).
++#[cfg(windows)]
++pub(crate) fn mip_skip(this: This) -> u32 {
++    if this.is_null() {
++        return 0;
++    }
++    let r = resource(this);
++    if r.desc.dimension == BUFFER {
++        return 0;
++    }
++    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
++    made.as_ref().map_or(0, |m| m.0.skip)
++}
++
+ /// Whether the title fills texture `this` itself ([`fills`]).
+ #[cfg(windows)]
+ pub(crate) fn title_fills(this: This) -> bool {
+@@ -1309,7 +1372,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
+             .clear
+             .as_ref()
+             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
+-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
++        let skip = reduce_by(&r.desc);
++        let mut desc = r.desc;
++        desc.width >>= skip;
++        desc.height >>= skip;
++        desc.mip_levels -= skip as u16;
++        let Some(texture) = host_texture(&desc, r.host.state, clear) else {
+             r.host.refused.store(true, Relaxed);
+             return None;
+         };
+@@ -1327,6 +1395,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
+         }
+         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+         let mut host = HostTexture::new(texture, state);
++        host.skip = skip;
+         host.filled = fills(&r.desc);
+         if host.filled {
+             KINDS[0].fetch_add(1, Relaxed);
+@@ -1385,11 +1454,28 @@ pub(crate) fn room() -> bool {
+         return true;
+     }
+     match crate::host::host().and_then(|h| h.video_memory()) {
+-        Some([budget, used, ..]) => used < budget / 10 * 9,
++        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+         None => filled < WITHOUT_BUDGET,
+     }
+ }
+ 
++/// The share of the card's budget in use below which [`room`] makes more
++/// texture copies: `VICTORY_TEXTURE_ROOM_PCT` (50 to 99), else 90. With
++/// big buffer copies on the card (`VICTORY_CARD_BUFFERS_MIN_MB=1`, 512 MB)
++/// a 6 GB card in the Series S profile sat at 4,657 of 5,152 MB, just over
++/// nine tenths, and some 4,000 textures waited (black) for minutes.
++#[cfg(windows)]
++fn room_percent() -> u64 {
++    static PCT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *PCT.get_or_init(|| {
++        std::env::var("VICTORY_TEXTURE_ROOM_PCT")
++            .ok()
++            .and_then(|v| v.trim().parse::<u64>().ok())
++            .filter(|p| (50..=99).contains(p))
++            .unwrap_or(90)
++    })
++}
++
+ /// Lets go of the host copies of textures the title fills that nothing
+ /// names any more: placed textures were never released (one host texture
+ /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
+@@ -1556,6 +1642,7 @@ impl HostTexture {
+             state: std::sync::atomic::AtomicU32::new(state),
+             bytes,
+             filled: false,
++            skip: 0,
+         }
+     }
+ }
+diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
+index 1fcc321..6850d37 100644
+--- a/crates/victory-gpu/src/shader_cache.rs
++++ b/crates/victory-gpu/src/shader_cache.rs
+@@ -67,6 +67,7 @@ fn build() -> &'static [u8; 32] {
+             u32::from(victory_shader::emit::group_sync()),
+             // And which clean-up passes ran over the translated code.
+             victory_shader::emit::shader_opt(),
++            u32::from(victory_shader::emit::rays_miss()),
+         ] {
+             hash.update(&n.to_le_bytes());
+         }
+@@ -75,6 +76,7 @@ fn build() -> &'static [u8; 32] {
+         // the translations an earlier run had cached with the switch unset.
+         for name in [
+             "VICTORY_WAVE_WIDE",
++            "VICTORY_WAVE_WIDE_FOR",
+             "VICTORY_WAVE_DEEP_SKIPS",
+             "VICTORY_WAVE_OWN_BITS",
+             "VICTORY_WAVE_LOCAL",
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index 4f3ad49..6402208 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -46,6 +46,9 @@ pub(crate) struct Staging {
+     /// The first of them that is uploaded, and the bytes of title memory
+     /// read for it and the smaller ones.
+     first: u32,
++    /// Title mips the host texture leaves out: host mip `m` is title mip
++    /// `m + skip` (`resource::reduce_by`).
++    skip: u32,
+     size: usize,
+     /// The staging buffer's bytes (counted in `STAGED` while it lives).
+     bytes: u64,
+@@ -615,13 +618,13 @@ impl Staging {
+     /// The mip and the array slice of the `i`th part of the staging buffer.
+     fn part(&self, i: usize) -> (u32, u32) {
+         let mips = self.mips - self.first;
+-        (self.first + i as u32 % mips, i as u32 / mips)
++        (self.skip + self.first + i as u32 % mips, i as u32 / mips)
+     }
+ 
+     /// The texture's subresource the `i`th part of the staging buffer is.
+     fn subresource(&self, i: usize) -> u32 {
+         let (mip, slice) = self.part(i);
+-        slice * self.mips + mip
++        slice * self.mips + mip - self.skip
+     }
+ 
+     /// Detiles the texture memory into the staging buffer if it changed
+@@ -1034,7 +1037,7 @@ fn staged_from(resource: This) -> u32 {
+     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+     map.as_ref()
+         .and_then(|map| map.get(&(resource as usize)))
+-        .map_or(u32::MAX, |s| s.first)
++        .map_or(u32::MAX, |s| s.first + s.skip)
+ }
+ 
+ /// Whether `[at, at + len)` is committed memory (streamed textures may be
+@@ -1195,7 +1198,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
+     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+     let map = map.get_or_insert_with(HashMap::new);
+     if let Some(s) = map.get(&(resource as usize))
+-        && s.first <= first
++        && s.first + s.skip <= first.max(s.skip)
+     {
+         return Some(s.clone());
+     }
+@@ -1215,13 +1218,16 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
+     let host = host()?;
+     // SAFETY: a live resource.
+     let d = unsafe { texture.GetDesc() };
++    // A host copy with fewer mips than the title's leaves out its largest.
++    let skip = u32::from(desc.mip_levels()).saturating_sub(u32::from(d.MipLevels));
++    let first = first.saturating_sub(skip);
+     // Only where the title's layout can end behind the smaller mips.
+-    let first = if first < u32::from(d.MipLevels) && layout.bytes_from(first) < layout.size {
++    let first = if first < u32::from(d.MipLevels) && layout.bytes_from(first + skip) < layout.size {
+         first
+     } else {
+         0
+     };
+-    let size = layout.bytes_from(first) as usize;
++    let size = layout.bytes_from(first + skip) as usize;
+     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+         u32::from(d.MipLevels)
+     } else {
+@@ -1263,6 +1269,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
+         layout,
+         mips: u32::from(d.MipLevels),
+         first,
++        skip,
+         size,
+         bytes: total,
+         memory,
+diff --git a/crates/victory-loader/src/console_insn.rs b/crates/victory-loader/src/console_insn.rs
+index ca1eb8c..865275b 100644
+--- a/crates/victory-loader/src/console_insn.rs
++++ b/crates/victory-loader/src/console_insn.rs
+@@ -97,6 +97,27 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
+     Some(to.min(end))
+ }
+ 
++/// Rewrites the `len` bytes at `rip` (one instruction) as `start` followed by NOPs.
++///
++/// # Safety
++/// `rip` is the start of an instruction of `len` bytes in mapped code.
++unsafe fn patch_in_place(rip: usize, len: usize, start: &[u8]) {
++    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
++    if start.len() > len {
++        return;
++    }
++    let mut old = 0u32;
++    // SAFETY: the instruction's own bytes, made writable for the patch and restored.
++    unsafe {
++        if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
++            let bytes = std::slice::from_raw_parts_mut(rip as *mut u8, len);
++            bytes.fill(0x90);
++            bytes[..start.len()].copy_from_slice(start);
++            VirtualProtect(rip as *const _, len, old, &mut old);
++        }
++    }
++}
++
+ /// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
+ /// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
+ /// see it).
+@@ -149,8 +170,21 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
+                 }
+             }
+         }
+-        ConsoleOnly::Monitorx => {}
+-        ConsoleOnly::Mwaitx => std::hint::spin_loop(),
++        // A wait hint in the title's spin loops, which test their condition
++        // again after it: patched once, so they stop raising an exception on
++        // every turn (tens of thousands a second on an Intel CPU). MONITORX
++        // only arms the wait: NOPs. MWAITX waits: PAUSE (F3 90), the PC's
++        // spin-wait hint, then NOPs.
++        ConsoleOnly::Monitorx => {
++            std::hint::spin_loop();
++            // SAFETY: the instruction's own `len` bytes at `rip`.
++            unsafe { patch_in_place(rip, len, &[]) };
++        }
++        ConsoleOnly::Mwaitx => {
++            std::hint::spin_loop();
++            // SAFETY: as above.
++            unsafe { patch_in_place(rip, len, &[0xF3, 0x90]) };
++        }
+         ConsoleOnly::Clzero => {
+             // with an address-size prefix (0x67) the line is at EAX, zero-extended
+             let a32 = code[..len - 3].contains(&0x67);
+diff --git a/crates/victory-loader/src/lib.rs b/crates/victory-loader/src/lib.rs
+index 28cabd6..5cc8c88 100644
+--- a/crates/victory-loader/src/lib.rs
++++ b/crates/victory-loader/src/lib.rs
+@@ -56,6 +56,31 @@ pub use windows::{
+     BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dll, load_title_dlls,
+ };
+ 
++/// Replaces the bytes at `at` with `new` if they are `expected` now (a
++/// patch of a loaded image's code in memory; the file is not touched).
++/// Returns whether it was written.
++#[cfg(windows)]
++pub fn patch_code(at: usize, expected: &[u8], new: &[u8]) -> bool {
++    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
++    if expected.len() != new.len() || new.is_empty() {
++        return false;
++    }
++    // SAFETY: the caller names bytes inside a mapped image; they are read
++    // and, when they match, made writable, written and protected again.
++    unsafe {
++        if std::slice::from_raw_parts(at as *const u8, expected.len()) != expected {
++            return false;
++        }
++        let mut old = 0u32;
++        if VirtualProtect(at as *const _, new.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
++            return false;
++        }
++        std::ptr::copy_nonoverlapping(new.as_ptr(), at as *mut u8, new.len());
++        VirtualProtect(at as *const _, new.len(), old, &mut old);
++    }
++    true
++}
++
+ /// `DLL_PROCESS_ATTACH`, for TLS callbacks.
+ pub const DLL_PROCESS_ATTACH: u32 = 1;
+ /// `DLL_PROCESS_DETACH`.
+diff --git a/crates/victory-shader/src/emit/intersect.rs b/crates/victory-shader/src/emit/intersect.rs
+index 78a1d99..505491a 100644
+--- a/crates/victory-shader/src/emit/intersect.rs
++++ b/crates/victory-shader/src/emit/intersect.rs
+@@ -116,6 +116,23 @@ impl<'a> Lower<'a> {
+             return Err("a ray-tracing structure that returns triangle ids");
+         }
+         let guard = self.guard(b, i)?;
++        if crate::emit::rays_miss() {
++            // Every ray misses (see `rays_miss`): a box node enters no
++            // child, a triangle node is not hit, so a walk ends at once.
++            let v = inst.read(Reg::V(regs[0])).ok_or("an unread operand")?;
++            let pointer = self.i32_of(v)?;
++            let c = self.cur;
++            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
++            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
++            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
++            let none = self.s.m.i32(bvh::NONE);
++            for (k, f) in bvh::MISS.iter().enumerate() {
++                let miss = self.s.m.i32(f.to_bits());
++                let v = self.s.m.select(c, is_box, none, miss);
++                self.write(inst, Reg::V(dst + k as u8), v, guard);
++            }
++            return Ok(());
++        }
+         let mut x = Vec::with_capacity(regs.len());
+         for &r in &regs {
+             let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 5ef1c81..57231a8 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -119,6 +119,16 @@ pub use shader::{
+ };
+ 
+ /// The loop limit without an override: 2^20.
++/// `VICTORY_RT_MISS=1`: every ray-tracing node test returns a miss. With
++/// the console's structure builder off nothing builds the structures the
++/// title's rays walk, and what they read there (zeros, stale memory) made
++/// its ray-traced shadow and light come out black; with every ray missing,
++/// nothing blocks light (no ray-traced shadows, but lit surfaces).
++pub fn rays_miss() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_RT_MISS").is_some_and(|v| v == "1"))
++}
++
+ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
+ 
+ /// The iteration count after which a translated loop is left, per lane and
+@@ -379,7 +389,7 @@ pub fn emit(
+         // lost the card in a submission of two programs that had just moved to it
+         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
+         // has no barrier, stays on.
+-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
++        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || wide_named(c);
+         // exact first: each host wave on its own where that is exact (the idiom, every
+         // form; no barriers), then the other exact forms; then approximate
+         for exact in [true, false] {
+@@ -496,6 +506,31 @@ pub fn emit(
+     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+ }
+ 
++/// `VICTORY_WAVE_WIDE_FOR=<name>,...`: the wave-wide form ([`widen`]) for the
++/// programs whose container names one of these (the title's program names,
++/// such as `CS_Visibility_`), without turning it on for every program
++/// (`VICTORY_WAVE_WIDE=1`, which lost an AMD card on two particle programs).
++/// On a 32-lane NVIDIA card Grand Theft Auto VI's `CS_Visibility` and
++/// `CS_Tiling_Generate_Opaque` have no other form the host takes: without it
++/// they were refused every frame (64-lane waves).
++fn wide_named(c: &Container) -> bool {
++    static NAMES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
++    let names = NAMES.get_or_init(|| {
++        std::env::var("VICTORY_WAVE_WIDE_FOR")
++            .unwrap_or_default()
++            .split(',')
++            .map(|n| n.trim().as_bytes().to_vec())
++            .filter(|n| n.len() >= 4)
++            .collect()
++    });
++    !names.is_empty()
++        && c.parts.iter().any(|part| {
++            names
++                .iter()
++                .any(|n| part.data.windows(n.len()).any(|w| w == n.as_slice()))
++        })
++}
++
+ /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
+ /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
+ /// lowering names the blocks where the two host waves must meet and could not
